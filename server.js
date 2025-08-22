@@ -1,12 +1,115 @@
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
+import { resolve4, resolve6 } from "dns/promises";
+import net from "net";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // CORS: Open broadly (no cookies). You can lock down later if desired.
 app.use(cors());
+
+function isPrivateIPv4(ip) {
+  const b = ip.split(".").map(Number);
+  return (
+    b[0] === 10 ||
+    (b[0] === 172 && b[1] >= 16 && b[1] <= 31) ||
+    (b[0] === 192 && b[1] === 168) ||
+    (b[0] === 169 && b[1] === 254) || // link-local
+    ip === "127.0.0.1"
+  );
+}
+function isPrivateIPv6(ip) {
+  // ::1 loopback, fc00::/7 unique local, fe80::/10 link-local
+  return (
+    ip === "::1" ||
+    ip.startsWith("fc") ||
+    ip.startsWith("fd") ||
+    ip.startsWith("fe8") ||
+    ip.startsWith("fe9") ||
+    ip.startsWith("fea") ||
+    ip.startsWith("feb")
+  );
+}
+function isPrivateIP(ip) {
+  if (net.isIP(ip) === 4) return isPrivateIPv4(ip);
+  if (net.isIP(ip) === 6) return isPrivateIPv6(ip);
+  return false;
+}
+async function hostIsSafe(hostname) {
+  const a4 = await resolve4(hostname).catch(() => []);
+  const a6 = await resolve6(hostname).catch(() => []);
+  const ips = [...a4, ...a6];
+  // If unresolved, let fetch handle it; if resolved, ensure none are private
+  return ips.length === 0 ? true : ips.every((ip) => !isPrivateIP(ip));
+}
+
+// Follow redirects safely and block private/internal hosts
+async function safeHttpGet(startUrl, maxBytes = 200000) {
+  let url = startUrl;
+  for (let hops = 0; hops < 5; hops++) {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return { ok: false, status: 0, error: "invalid_url" };
+    }
+    if (u.protocol !== "https:" && u.protocol !== "http:") {
+      return { ok: false, status: 0, error: "unsupported_protocol" };
+    }
+    // Block obvious bad hosts
+    const hostLower = u.hostname.toLowerCase();
+    if (
+      hostLower === "localhost" ||
+      hostLower === "0.0.0.0" ||
+      hostLower.endsWith(".local") ||
+      hostLower.endsWith(".internal") ||
+      hostLower === "metadata.google.internal"
+    )
+      return { ok: false, status: 0, error: "blocked_host" };
+
+    // DNS safety
+    const safe = await hostIsSafe(u.hostname);
+    if (!safe) return { ok: false, status: 0, error: "private_ip_blocked" };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      const r = await fetch(url, {
+        redirect: "manual",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; SlickdealFinderBot/1.0)",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        signal: controller.signal,
+      });
+      const loc = r.headers.get("location");
+
+      // Handle 30x manually to re-check host each hop
+      if ([301, 302, 303, 307, 308].includes(r.status) && loc) {
+        url = new URL(loc, url).toString();
+        continue;
+      }
+
+      const ct = r.headers.get("content-type") || "";
+      const isTextLike = /text|json|xml|html/i.test(ct);
+      let text = "";
+      if (isTextLike) {
+        const buf = await r.arrayBuffer();
+        const slice = buf.slice(0, Math.min(maxBytes, buf.byteLength));
+        text = new TextDecoder("utf-8").decode(slice);
+      }
+      return { ok: r.ok, status: r.status, url: r.url, content_type: ct, text };
+    } catch (e) {
+      return { ok: false, status: 0, error: String(e) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return { ok: false, status: 0, error: "too_many_redirects" };
+}
 
 // --- CONFIG ---
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // set in Render
@@ -189,56 +292,173 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 // Main endpoint
 app.post("/deal-search", async (req, res) => {
+  const { query, prefs } = req.body || {};
+  console.log(
+    `[deal-search] query="${query || ""}" at ${new Date().toISOString()}`
+  );
+
   try {
     if (!OPENAI_API_KEY)
       return res.status(500).json({ error: "server not configured" });
     if (EXT_SHARED_TOKEN && req.get("x-ext-token") !== EXT_SHARED_TOKEN) {
       return res.status(403).json({ error: "forbidden" });
     }
-
-    const { query, prefs } = req.body || {};
     if (!query) return res.status(400).json({ error: "missing query" });
 
-    const body = {
-      model: OPENAI_MODEL,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: JSON.stringify({ query, prefs }) },
-      ],
-    };
-
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
+    // ----- tools definition -----
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "http_get",
+          description:
+            "Fetch a web page over HTTP(S). Returns text (truncated). Use to verify prices, SD posts, merchant pages.",
+          parameters: {
+            type: "object",
+            properties: {
+              url: {
+                type: "string",
+                description: "Absolute URL (https://...)",
+              },
+              max_bytes: { type: "integer", default: 200000 },
+            },
+            required: ["url"],
+          },
+        },
       },
-      body: JSON.stringify(body),
-    });
+    ];
 
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      return res
-        .status(502)
-        .json({ error: `openai ${r.status}`, detail: t.slice(0, 800) });
+    // ----- conversation seed -----
+    const messages = [
+      {
+        role: "system",
+        content:
+          SYSTEM_PROMPT +
+          "\nUse tools to fetch pages and verify evidence. When finished, output only the strict JSON envelope.",
+      },
+      { role: "user", content: JSON.stringify({ query, prefs }) },
+    ];
+
+    let finalJson = null;
+
+    for (let step = 0; step < 6; step++) {
+      const r1 = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: OPENAI_MODEL, // "gpt-5"
+          messages,
+          tools,
+          tool_choice: "auto", // let the model call http_get if it wants
+        }),
+      });
+
+      if (!r1.ok) {
+        const t = await r1.text().catch(() => "");
+        return res
+          .status(502)
+          .json({ error: `openai ${r1.status}`, detail: t.slice(0, 800) });
+      }
+
+      const j1 = await r1.json();
+      const msg = j1?.choices?.[0]?.message;
+      const toolCalls = msg?.tool_calls || [];
+
+      if (toolCalls.length) {
+        // Execute tool calls, append results
+        for (const call of toolCalls) {
+          const name = call.function?.name;
+          let args = {};
+          try {
+            args = JSON.parse(call.function?.arguments || "{}");
+          } catch {}
+          if (name === "http_get") {
+            const { url, max_bytes } = args;
+            console.log(`[http_get] ${url}`);
+            const result = await safeHttpGet(url, max_bytes || 200000);
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: JSON.stringify(result),
+            });
+          } else {
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: JSON.stringify({
+                ok: false,
+                error: `unknown_tool:${name}`,
+              }),
+            });
+          }
+        }
+        // Allow the model to use the tool outputs
+        continue;
+      }
+
+      // No tool calls — try to parse final JSON
+      const content = msg?.content?.trim();
+      try {
+        finalJson = JSON.parse(content);
+      } catch {
+        // One pass to force strict JSON
+        messages.push({
+          role: "system",
+          content:
+            "Return only a single strict JSON object per the schema. No commentary.",
+        });
+        messages.push({ role: "assistant", content }); // echo for context
+        const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: OPENAI_MODEL,
+            messages,
+            response_format: { type: "json_object" },
+          }),
+        });
+        if (!r2.ok) {
+          const t2 = await r2.text().catch(() => "");
+          return res
+            .status(502)
+            .json({ error: `openai ${r2.status}`, detail: t2.slice(0, 800) });
+        }
+        const j2 = await r2.json();
+        const c2 = j2?.choices?.[0]?.message?.content?.trim();
+        try {
+          finalJson = JSON.parse(c2);
+        } catch {}
+      }
+      break; // leave loop after a non-tool reply
     }
 
-    const j = await r.json();
-    const content = j?.choices?.[0]?.message?.content?.trim();
-    if (!content) return res.status(502).json({ error: "empty completion" });
-
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      return res.status(502).json({
-        error: "invalid json from model",
-        content: content.slice(0, 5000),
+    if (!finalJson) {
+      // safe fallback
+      return res.json({
+        query: query || "",
+        generated_at: new Date().toISOString(),
+        mode: "search_urls",
+        qualified: [],
+        borderline: [],
+        not_qualified: [],
+        notes: [
+          `https://www.google.com/search?q=${encodeURIComponent(
+            query
+          )}+price+drop`,
+          `https://www.google.com/search?q=site%3Aslickdeals.net+${encodeURIComponent(
+            query
+          )}`,
+        ],
       });
     }
 
-    res.json(parsed);
+    res.json(finalJson);
   } catch (e) {
     res
       .status(500)
