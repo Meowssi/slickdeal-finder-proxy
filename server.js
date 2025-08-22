@@ -1,3 +1,6 @@
+// server.js
+// Slickdeal Finder proxy with tool-browsing (http_get) + strict JSON output.
+
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -7,117 +10,18 @@ import net from "net";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// CORS: Open broadly (no cookies). You can lock down later if desired.
+// CORS: start open; you can later restrict to your extension id:
+// app.use(cors({ origin: ["chrome-extension://<YOUR_EXTENSION_ID>"], methods: ["GET","POST"], allowedHeaders: ["Content-Type","x-ext-token"] }));
 app.use(cors());
 
-function isPrivateIPv4(ip) {
-  const b = ip.split(".").map(Number);
-  return (
-    b[0] === 10 ||
-    (b[0] === 172 && b[1] >= 16 && b[1] <= 31) ||
-    (b[0] === 192 && b[1] === 168) ||
-    (b[0] === 169 && b[1] === 254) || // link-local
-    ip === "127.0.0.1"
-  );
-}
-function isPrivateIPv6(ip) {
-  // ::1 loopback, fc00::/7 unique local, fe80::/10 link-local
-  return (
-    ip === "::1" ||
-    ip.startsWith("fc") ||
-    ip.startsWith("fd") ||
-    ip.startsWith("fe8") ||
-    ip.startsWith("fe9") ||
-    ip.startsWith("fea") ||
-    ip.startsWith("feb")
-  );
-}
-function isPrivateIP(ip) {
-  if (net.isIP(ip) === 4) return isPrivateIPv4(ip);
-  if (net.isIP(ip) === 6) return isPrivateIPv6(ip);
-  return false;
-}
-async function hostIsSafe(hostname) {
-  const a4 = await resolve4(hostname).catch(() => []);
-  const a6 = await resolve6(hostname).catch(() => []);
-  const ips = [...a4, ...a6];
-  // If unresolved, let fetch handle it; if resolved, ensure none are private
-  return ips.length === 0 ? true : ips.every((ip) => !isPrivateIP(ip));
-}
+// ---- Config from environment ----
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // REQUIRED (your OpenAI key in Render)
+const EXT_SHARED_TOKEN = process.env.EXT_SHARED_TOKEN || ""; // RECOMMENDED (shared secret header)
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5"; // GPT-5 (thinking)
 
-// Follow redirects safely and block private/internal hosts
-async function safeHttpGet(startUrl, maxBytes = 200000) {
-  let url = startUrl;
-  for (let hops = 0; hops < 5; hops++) {
-    let u;
-    try {
-      u = new URL(url);
-    } catch {
-      return { ok: false, status: 0, error: "invalid_url" };
-    }
-    if (u.protocol !== "https:" && u.protocol !== "http:") {
-      return { ok: false, status: 0, error: "unsupported_protocol" };
-    }
-    // Block obvious bad hosts
-    const hostLower = u.hostname.toLowerCase();
-    if (
-      hostLower === "localhost" ||
-      hostLower === "0.0.0.0" ||
-      hostLower.endsWith(".local") ||
-      hostLower.endsWith(".internal") ||
-      hostLower === "metadata.google.internal"
-    )
-      return { ok: false, status: 0, error: "blocked_host" };
-
-    // DNS safety
-    const safe = await hostIsSafe(u.hostname);
-    if (!safe) return { ok: false, status: 0, error: "private_ip_blocked" };
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12000);
-    try {
-      const r = await fetch(url, {
-        redirect: "manual",
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; SlickdealFinderBot/1.0)",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        signal: controller.signal,
-      });
-      const loc = r.headers.get("location");
-
-      // Handle 30x manually to re-check host each hop
-      if ([301, 302, 303, 307, 308].includes(r.status) && loc) {
-        url = new URL(loc, url).toString();
-        continue;
-      }
-
-      const ct = r.headers.get("content-type") || "";
-      const isTextLike = /text|json|xml|html/i.test(ct);
-      let text = "";
-      if (isTextLike) {
-        const buf = await r.arrayBuffer();
-        const slice = buf.slice(0, Math.min(maxBytes, buf.byteLength));
-        text = new TextDecoder("utf-8").decode(slice);
-      }
-      return { ok: r.ok, status: r.status, url: r.url, content_type: ct, text };
-    } catch (e) {
-      return { ok: false, status: 0, error: String(e) };
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  return { ok: false, status: 0, error: "too_many_redirects" };
-}
-
-// --- CONFIG ---
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // set in Render
-const EXT_SHARED_TOKEN = process.env.EXT_SHARED_TOKEN || ""; // optional shared secret (recommended)
-const OPENAI_MODEL = "gpt-5";
-
-// Paste your **latest** Slickdeal Finder prompt below:
-const SYSTEM_PROMPT = `You are **SlickDeal Finder**, a specialized agent that accepts a user search term and returns a ranked set of **Slickdeals-worthy** offers.
+// ---- Your Slickdeal Finder system prompt ----
+const SYSTEM_PROMPT =
+  `You are **SlickDeal Finder**, a specialized agent that accepts a user search term and returns a ranked set of **Slickdeals-worthy** offers.
 
 **Prime Directive**
 Return only deals likely to be approved by the Slickdeals community. Each qualified deal must:
@@ -285,12 +189,109 @@ If you cannot verify live prices **and** last-365-day Slickdeals history, set "m
 **Style**
 
 - Terse. No prose outside the JSON envelope.
-- No hallucinated values. Every numeric claim must map to a real page you can link in \`evidence\`.`;
+- No hallucinated values. Every numeric claim must map to a real page you can link in \`evidence\`.`.trim();
 
-// Health
+// ---- Health check ----
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Main endpoint
+// ---- Helpers: IP/host safety + HTTP fetch with limits ----
+function isPrivateIPv4(ip) {
+  const b = ip.split(".").map(Number);
+  return (
+    b[0] === 10 ||
+    (b[0] === 172 && b[1] >= 16 && b[1] <= 31) ||
+    (b[0] === 192 && b[1] === 168) ||
+    (b[0] === 169 && b[1] === 254) ||
+    ip === "127.0.0.1"
+  );
+}
+function isPrivateIPv6(ip) {
+  return (
+    ip === "::1" ||
+    ip.startsWith("fc") ||
+    ip.startsWith("fd") ||
+    ip.startsWith("fe8") ||
+    ip.startsWith("fe9") ||
+    ip.startsWith("fea") ||
+    ip.startsWith("feb")
+  );
+}
+function isPrivateIP(ip) {
+  if (net.isIP(ip) === 4) return isPrivateIPv4(ip);
+  if (net.isIP(ip) === 6) return isPrivateIPv6(ip);
+  return false;
+}
+async function hostIsSafe(hostname) {
+  const a4 = await resolve4(hostname).catch(() => []);
+  const a6 = await resolve6(hostname).catch(() => []);
+  const ips = [...a4, ...a6];
+  return ips.length === 0 ? true : ips.every((ip) => !isPrivateIP(ip));
+}
+
+// Follow 30x manually (re-check host each hop), block private/localhost, cap size/time
+async function safeHttpGet(startUrl, maxBytes = 200000) {
+  let url = startUrl;
+  for (let hops = 0; hops < 5; hops++) {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return { ok: false, status: 0, error: "invalid_url" };
+    }
+    if (u.protocol !== "https:" && u.protocol !== "http:") {
+      return { ok: false, status: 0, error: "unsupported_protocol" };
+    }
+    const hostLower = u.hostname.toLowerCase();
+    if (
+      hostLower === "localhost" ||
+      hostLower === "0.0.0.0" ||
+      hostLower.endsWith(".local") ||
+      hostLower.endsWith(".internal") ||
+      hostLower === "metadata.google.internal"
+    ) {
+      return { ok: false, status: 0, error: "blocked_host" };
+    }
+
+    const safe = await hostIsSafe(u.hostname);
+    if (!safe) return { ok: false, status: 0, error: "private_ip_blocked" };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      const r = await fetch(url, {
+        redirect: "manual",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; SlickdealFinderBot/1.0)",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        signal: controller.signal,
+      });
+      const loc = r.headers.get("location");
+      if ([301, 302, 303, 307, 308].includes(r.status) && loc) {
+        url = new URL(loc, url).toString();
+        continue;
+      }
+
+      const ct = r.headers.get("content-type") || "";
+      const isTextLike = /text|json|xml|html/i.test(ct);
+      let text = "";
+      if (isTextLike) {
+        const buf = await r.arrayBuffer();
+        const slice = buf.slice(0, Math.min(maxBytes, buf.byteLength));
+        text = new TextDecoder("utf-8").decode(slice);
+      }
+      return { ok: r.ok, status: r.status, url: r.url, content_type: ct, text };
+    } catch (e) {
+      return { ok: false, status: 0, error: String(e) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return { ok: false, status: 0, error: "too_many_redirects" };
+}
+
+// ---- Main endpoint ----
 app.post("/deal-search", async (req, res) => {
   const { query, prefs } = req.body || {};
   console.log(
@@ -305,14 +306,31 @@ app.post("/deal-search", async (req, res) => {
     }
     if (!query) return res.status(400).json({ error: "missing query" });
 
-    // ----- tools definition -----
+    // Starter search URLs; the model can choose to explore these via http_get
+    const seeds = {
+      search_urls: [
+        `https://slickdeals.net/newsearch.php?src=SearchBarV2&q=${encodeURIComponent(
+          query
+        )}&forumid=all`,
+        `https://html.duckduckgo.com/html/?q=${encodeURIComponent(
+          query + " best price"
+        )}`,
+        `https://www.amazon.com/s?k=${encodeURIComponent(query)}`,
+        `https://www.walmart.com/search?q=${encodeURIComponent(query)}`,
+        `https://www.bestbuy.com/site/searchpage.jsp?st=${encodeURIComponent(
+          query
+        )}`,
+      ],
+    };
+
+    // Tool definition exposed to the model
     const tools = [
       {
         type: "function",
         function: {
           name: "http_get",
           description:
-            "Fetch a web page over HTTP(S). Returns text (truncated). Use to verify prices, SD posts, merchant pages.",
+            "Fetch a web page over HTTP(S). Returns text (truncated). Use to verify prices, coupons, and last-365d Slickdeals posts.",
           parameters: {
             type: "object",
             properties: {
@@ -328,20 +346,20 @@ app.post("/deal-search", async (req, res) => {
       },
     ];
 
-    // ----- conversation seed -----
+    // Seed conversation
     const messages = [
       {
         role: "system",
         content:
           SYSTEM_PROMPT +
-          "\nUse tools to fetch pages and verify evidence. When finished, output only the strict JSON envelope.",
+          "\nUse tools to fetch pages and verify evidence. Prefer starter search URLs if you need discovery. When finished, output only the strict JSON envelope.",
       },
-      { role: "user", content: JSON.stringify({ query, prefs }) },
+      { role: "user", content: JSON.stringify({ query, prefs, seeds }) },
     ];
 
+    // Tool-calling loop
     let finalJson = null;
-
-    for (let step = 0; step < 6; step++) {
+    for (let step = 0; step < 8; step++) {
       const r1 = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -349,10 +367,10 @@ app.post("/deal-search", async (req, res) => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: OPENAI_MODEL, // "gpt-5"
+          model: OPENAI_MODEL, // gpt-5
           messages,
           tools,
-          tool_choice: "auto", // let the model call http_get if it wants
+          tool_choice: "auto",
         }),
       });
 
@@ -368,14 +386,12 @@ app.post("/deal-search", async (req, res) => {
       const toolCalls = msg?.tool_calls || [];
 
       if (toolCalls.length) {
-        // Execute tool calls, append results
         for (const call of toolCalls) {
-          const name = call.function?.name;
           let args = {};
           try {
             args = JSON.parse(call.function?.arguments || "{}");
           } catch {}
-          if (name === "http_get") {
+          if (call.function?.name === "http_get") {
             const { url, max_bytes } = args;
             console.log(`[http_get] ${url}`);
             const result = await safeHttpGet(url, max_bytes || 200000);
@@ -388,14 +404,11 @@ app.post("/deal-search", async (req, res) => {
             messages.push({
               role: "tool",
               tool_call_id: call.id,
-              content: JSON.stringify({
-                ok: false,
-                error: `unknown_tool:${name}`,
-              }),
+              content: JSON.stringify({ ok: false, error: "unknown_tool" }),
             });
           }
         }
-        // Allow the model to use the tool outputs
+        // Loop again so the model can use tool outputs
         continue;
       }
 
@@ -404,13 +417,13 @@ app.post("/deal-search", async (req, res) => {
       try {
         finalJson = JSON.parse(content);
       } catch {
-        // One pass to force strict JSON
+        // One more pass forcing strict JSON
         messages.push({
           role: "system",
           content:
-            "Return only a single strict JSON object per the schema. No commentary.",
+            "Return only a single strict JSON object per the schema. No markdown, no code fences, no commentary.",
         });
-        messages.push({ role: "assistant", content }); // echo for context
+        messages.push({ role: "assistant", content }); // echo back to give context
         const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -433,13 +446,15 @@ app.post("/deal-search", async (req, res) => {
         const c2 = j2?.choices?.[0]?.message?.content?.trim();
         try {
           finalJson = JSON.parse(c2);
-        } catch {}
+        } catch {
+          /* fall through */
+        }
       }
-      break; // leave loop after a non-tool reply
+      break; // exit after a non-tool response
     }
 
+    // Safe fallback
     if (!finalJson) {
-      // safe fallback
       return res.json({
         query: query || "",
         generated_at: new Date().toISOString(),
@@ -466,6 +481,7 @@ app.post("/deal-search", async (req, res) => {
   }
 });
 
+// ---- Start server ----
 const port = process.env.PORT || 8080;
 app.listen(port, () =>
   console.log("Slickdeal Finder proxy listening on " + port)
