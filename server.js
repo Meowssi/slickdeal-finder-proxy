@@ -202,7 +202,6 @@ app.post("/deal-search", async (req, res) => {
     const body = {
       model: OPENAI_MODEL,
       response_format: { type: "json_object" },
-      temperature: 0.2,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: JSON.stringify({ query, prefs }) },
