@@ -357,7 +357,7 @@ app.post("/deal-search", async (req, res) => {
       { role: "user", content: JSON.stringify({ query, prefs, seeds }) },
     ];
 
-    // Tool-calling loop
+    // ---- Tool-calling loop (fixed: push assistant msg before tool results) ----
     let finalJson = null;
     for (let step = 0; step < 8; step++) {
       const r1 = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -383,9 +383,18 @@ app.post("/deal-search", async (req, res) => {
 
       const j1 = await r1.json();
       const msg = j1?.choices?.[0]?.message;
-      const toolCalls = msg?.tool_calls || [];
 
+      // ✅ ALWAYS push the assistant message we just received
+      // (so tool messages directly follow it)
+      messages.push({
+        role: "assistant",
+        content: msg?.content ?? "",
+        tool_calls: msg?.tool_calls || undefined,
+      });
+
+      const toolCalls = msg?.tool_calls || [];
       if (toolCalls.length) {
+        // Execute tool calls; each tool result must follow the assistant-with-tool_calls
         for (const call of toolCalls) {
           let args = {};
           try {
@@ -408,12 +417,12 @@ app.post("/deal-search", async (req, res) => {
             });
           }
         }
-        // Loop again so the model can use tool outputs
+        // Loop again so the model can read tool outputs
         continue;
       }
 
-      // No tool calls — try to parse final JSON
-      const content = msg?.content?.trim();
+      // No tool calls this turn — try to parse final JSON
+      const content = msg?.content?.trim() || "";
       try {
         finalJson = JSON.parse(content);
       } catch {
@@ -423,7 +432,7 @@ app.post("/deal-search", async (req, res) => {
           content:
             "Return only a single strict JSON object per the schema. No markdown, no code fences, no commentary.",
         });
-        messages.push({ role: "assistant", content }); // echo back to give context
+        messages.push({ role: "assistant", content }); // echo for context
         const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -443,14 +452,12 @@ app.post("/deal-search", async (req, res) => {
             .json({ error: `openai ${r2.status}`, detail: t2.slice(0, 800) });
         }
         const j2 = await r2.json();
-        const c2 = j2?.choices?.[0]?.message?.content?.trim();
+        const c2 = j2?.choices?.[0]?.message?.content?.trim() || "";
         try {
           finalJson = JSON.parse(c2);
-        } catch {
-          /* fall through */
-        }
+        } catch {}
       }
-      break; // exit after a non-tool response
+      break; // exit after a non-tool reply
     }
 
     // Safe fallback
